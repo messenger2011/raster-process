@@ -1,6 +1,6 @@
 import fs from 'fs-extra';
 import path from 'path';
-import { isFunction, merge } from 'lodash';
+import { merge } from 'lodash';
 import Affine from '@sakitam-gis/affine';
 import { Constant, Mercantile } from '@sakitam-gis/mercantile';
 import { openAsync, GDT_Float32, GDT_Byte, SpatialReference } from 'gdal-async';
@@ -132,36 +132,59 @@ export default async (
       const bands = targetData.data.bands;
       const count = bands.count();
 
-      for (let b = 1; b < count + 1; b++) {
-        const e = bands.get(b);
-        const info = e.getMetadata();
-        const largeData = await enlargeData([targetData.path, targetData.data], {
-          ...(options.enlargeOptions || {}),
-          bandsIndex: b,
-        });
-        const bandName: string = isFunction(options.bandName) ? options?.bandName(z, b, info) : options.bandName;
+      for (const tile of tiles) {
+        const x = tile.getX();
+        const y = tile.getY();
 
-        for (const tile of tiles) {
-          const x = tile.getX();
-          const y = tile.getY();
-          const tileId = `${bandName ? bandName + '-' : ''}${z}-${x}-${y}`;
-          const tilePath = path.join(folder, options.tileFolder, bandName, String(z), String(x), `${y}.tiff`);
-          const tileState = await checkAndLoad(tilePath, options.clear, false);
-          needPaths.set(tileId, tilePath);
-          if (tileState[0]) {
-            tilesPath.set(tileId, tilePath);
-            continue;
-          } else {
-            await fs.ensureFileSync(tilePath);
-          }
-          const bbox = tile.getBBox();
+        // const bandName: string = isFunction(options.bandName) ? options?.bandName(z, b, info) : options.bandName;
+        const bandName = '';
+        const tileId = `${bandName ? bandName + '-' : ''}${z}-${x}-${y}`;
+        const tilePath = path.join(folder, options.tileFolder, bandName, String(z), String(x), `${y}.tiff`);
+        const tileState = await checkAndLoad(tilePath, options.clear, false);
+        needPaths.set(tileId, tilePath);
+        if (tileState[0]) {
+          tilesPath.set(tileId, tilePath);
+          continue;
+        } else {
+          await fs.ensureFileSync(tilePath);
+        }
+        const bbox = tile.getBBox();
 
-          const startX = x * options.tileSize;
-          const endX = (x + 1) * options.tileSize + 1;
-          const startY = y * options.tileSize;
-          const endY = (y + 1) * options.tileSize + 1;
+        const startX = x * options.tileSize;
+        const endX = (x + 1) * options.tileSize + 1;
+        const startY = y * options.tileSize;
+        const endY = (y + 1) * options.tileSize + 1;
 
-          const dst = ndarray([], [endX - startX, endY - startY]);
+        const dst = ndarray([], [endX - startX, endY - startY]);
+
+        await fs.ensureFileSync(tilePath);
+        const tileDst = await openAsync(
+          tilePath,
+          'w',
+          'GTiff',
+          dst.shape[0],
+          dst.shape[1],
+          isValid(options.bandCount, true) ? options.bandCount : 1,
+          options.gray ? GDT_Byte : options.dataType,
+        );
+
+        const [west, south, east, north] = [bbox.getLeft(), bbox.getBottom(), bbox.getRight(), bbox.getTop()];
+        const t = Affine.translation(west, north);
+        const s = Affine.scale((east - west) / dst.shape[0], (south - north) / dst.shape[1]);
+        tileDst.geoTransform = t.multiply(s).toGdal();
+
+        tileDst.srs = SpatialReference.fromProj4(options.tileProj4);
+
+        let minmaxExif = '';
+
+        for (let b = 1; b < count + 1; b++) {
+          const e = bands.get(b);
+          const info = e.getMetadata();
+
+          const largeData = await enlargeData([targetData.path, targetData.data], {
+            ...(options.enlargeOptions || {}),
+            bandsIndex: b,
+          });
 
           const clipDst = largeData.data.hi(endY, endX).lo(startY, startX);
 
@@ -172,25 +195,12 @@ export default async (
             }
           }
 
-          await fs.ensureFileSync(tilePath);
-          const tileDst = await openAsync(
-            tilePath,
-            'w',
-            'GTiff',
-            dst.shape[0],
-            dst.shape[1],
-            isValid(options.bandCount, true) ? options.bandCount : 1,
-            options.gray ? GDT_Byte : options.dataType,
-          );
-
-          const [west, south, east, north] = [bbox.getLeft(), bbox.getBottom(), bbox.getRight(), bbox.getTop()];
-          const t = Affine.translation(west, north);
-          const s = Affine.scale((east - west) / dst.shape[0], (south - north) / dst.shape[1]);
-          tileDst.geoTransform = t.multiply(s).toGdal();
-
-          tileDst.srs = SpatialReference.fromProj4(options.tileProj4);
-
-          const bd = tileDst.bands.get(1);
+          const bd =
+            info.GRIB_ELEMENT === 'VGRD'
+              ? tileDst.bands.get(1)
+              : info.GRIB_ELEMENT === 'UGRD'
+                ? tileDst.bands.get(2)
+                : tileDst.bands.get(b);
           const pixel = bd.pixels;
           const [min, max] = calcMinMax(dst.data);
 
@@ -199,25 +209,16 @@ export default async (
           }
 
           if (options.writeExif) {
-            tileDst.setMetadata({
-              ...info,
-              min,
-              max,
-              EXIF_ImageDescription: `${min},${max}`,
-            });
+            if (minmaxExif !== '') {
+              minmaxExif += ',';
+            }
+            minmaxExif += `${min},${max}`;
             bd.setMetadata({
               ...info,
               min,
               max,
-              EXIF_ImageDescription: `${min},${max}`,
             });
           } else {
-            tileDst.setMetadata({
-              ...info,
-              min,
-              max,
-            });
-
             bd.setMetadata({
               ...info,
               min,
@@ -235,7 +236,6 @@ export default async (
               imageData.set(j, k, v);
             }
           }
-
           await pixel.writeArrayAsync({
             x: 0,
             y: 0,
@@ -243,10 +243,17 @@ export default async (
             height: imageData.shape[1],
             data: imageData,
           });
+
           tilesPath.set(tileId, tilePath);
-          tileDst.flush();
-          tileDst.close();
         }
+
+        if (options.writeExif) {
+          tileDst.setMetadata({
+            EXIF_ImageDescription: minmaxExif,
+          });
+        }
+        tileDst.flush();
+        tileDst.close();
       }
     }
 
