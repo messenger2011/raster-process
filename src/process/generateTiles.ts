@@ -176,6 +176,7 @@ export default async (
         tileDst.srs = SpatialReference.fromProj4(options.tileProj4);
 
         let minmaxExif = '';
+        const minmaxByOutBand: Record<number, [number, number]> = {};
 
         for (let b = 1; b < count + 1; b++) {
           const e = bands.get(b);
@@ -195,12 +196,13 @@ export default async (
             }
           }
 
-          const bd =
-            info.GRIB_ELEMENT === 'VGRD'
-              ? tileDst.bands.get(1)
-              : info.GRIB_ELEMENT === 'UGRD'
-                ? tileDst.bands.get(2)
-                : tileDst.bands.get(b);
+          const outBandIdx =
+            info.GRIB_ELEMENT === 'UGRD'
+              ? 1
+              : info.GRIB_ELEMENT === 'VGRD'
+                ? 2
+                : b;
+          const bd = tileDst.bands.get(outBandIdx);
           const pixel = bd.pixels;
           const [min, max] = calcMinMax(dst.data);
 
@@ -209,10 +211,7 @@ export default async (
           }
 
           if (options.writeExif) {
-            if (minmaxExif !== '') {
-              minmaxExif += ',';
-            }
-            minmaxExif += `${min},${max}`;
+            minmaxByOutBand[outBandIdx] = [min, max];
             bd.setMetadata({
               ...info,
               min,
@@ -248,6 +247,8 @@ export default async (
         }
 
         if (options.writeExif) {
+          const sortedBandKeys = Object.keys(minmaxByOutBand).map(Number).sort((a, b) => a - b);
+          minmaxExif = sortedBandKeys.map((k) => minmaxByOutBand[k].join(',')).join(',');
           tileDst.setMetadata({
             EXIF_ImageDescription: minmaxExif,
           });
