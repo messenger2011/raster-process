@@ -3,7 +3,7 @@ import path from 'path';
 import { merge } from 'lodash';
 import Affine from '@sakitam-gis/affine';
 import { Constant, Mercantile } from '@sakitam-gis/mercantile';
-import { openAsync, GDT_Float32, GDT_Byte, SpatialReference } from 'gdal-async';
+import { openAsync, GDT_Float32, GDT_Byte, GRA_Average, SpatialReference } from 'gdal-async';
 import 'ndarray-gdal';
 import ndarray from 'ndarray';
 import { mercatorLngLatExtent } from '../config';
@@ -103,23 +103,57 @@ export default async (
     const zooms = Array.isArray(options.zooms)
       ? Constant.range(options.zooms[0], options.zooms[1], options.zooms[2])
       : Constant.range(options.zooms);
-    for (let i = 0; i < zooms.length; i++) {
-      const z = zooms[i];
+
+    // ── Phase 1: Build cache pyramid ──────────────────────────────────────────
+    // Reproject original source → highest zoom once, then cascade average-
+    // downsamples toward lower zoom levels. This replaces N independent full
+    // reproj calls with 1 full reproj + (N-1) cheap avg-downsamples and
+    // produces smoother lower-zoom tiles (2×2 block averaging vs re-sampling
+    // from the coarse original each time).
+    const sortedDesc = [...zooms].sort((a, b) => b - a);
+    const cacheByZoom = new Map<number, { path: string | Buffer; data: any }>();
+
+    for (let i = 0; i < sortedDesc.length; i++) {
+      const z = sortedDesc[i];
       const tileWidth = options.tileSize * 2 ** z;
       const tileHeight = options.tileSize * 2 ** z;
       const dstSrc = path.join(folder, options.cacheFolder, `${options.cacheFilePrefix}-${z}.tiff`);
       const fc = await checkAndLoad(dstSrc, options.clear);
-      // 如果有已生成的投影数据，直接从缓存取
       if (!fc[0]) {
         await fs.ensureFileSync(dstSrc);
       }
-      const targetData = fc[0]
-        ? fc[1]
-        : await reproject(['', lastDst, []], dstSrc, {
-            ...(options.reprojectOptions || {}),
-            width: tileWidth,
-            height: tileHeight,
-          });
+      if (fc[0]) {
+        // Already cached from a previous run
+        cacheByZoom.set(z, fc[1]);
+      } else if (i === 0) {
+        // Highest zoom: full reproject from original source (handles CRS conversion)
+        const targetData = await reproject(['', lastDst, []], dstSrc, {
+          ...(options.reprojectOptions || {}),
+          width: tileWidth,
+          height: tileHeight,
+        });
+        cacheByZoom.set(z, targetData);
+      } else {
+        // Lower zooms: average-downsample from the next-higher cached zoom.
+        // Both datasets share the same CRS (3857), so reprojectImageAsync
+        // performs a pure resize — no coordinate transformation needed.
+        const zAbove = sortedDesc[i - 1];
+        const above = cacheByZoom.get(zAbove)!;
+        const targetData = await reproject(['', above.data, []], dstSrc, {
+          ...(options.reprojectOptions || {}),
+          width: tileWidth,
+          height: tileHeight,
+          resampling: GRA_Average,
+          destinationProj4: options.tileProj4,
+        });
+        cacheByZoom.set(z, targetData);
+      }
+    }
+
+    // ── Phase 2: Slice tiles from the pyramid ────────────────────────────────
+    for (let i = 0; i < zooms.length; i++) {
+      const z = zooms[i];
+      const targetData = cacheByZoom.get(z)!;
       const tiles = Mercantile.tiles(
         options.tileExtent[0],
         options.tileExtent[1],
