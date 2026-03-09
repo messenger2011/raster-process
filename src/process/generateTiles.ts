@@ -3,7 +3,7 @@ import path from 'path';
 import { merge } from 'lodash';
 import Affine from '@sakitam-gis/affine';
 import { Constant, Mercantile } from '@sakitam-gis/mercantile';
-import { openAsync, GDT_Float32, GDT_Byte, GRA_Average, SpatialReference } from 'gdal-async';
+import { openAsync, GDT_Float32, GDT_Byte, GRA_Average, GRA_Bilinear, SpatialReference } from 'gdal-async';
 import 'ndarray-gdal';
 import ndarray from 'ndarray';
 import { mercatorLngLatExtent } from '../config';
@@ -126,8 +126,10 @@ export default async (
         // Already cached from a previous run
         cacheByZoom.set(z, fc[1]);
       } else if (i === 0) {
-        // Highest zoom: full reproject from original source (handles CRS conversion)
+        // Highest zoom: full reproject from original source (handles CRS conversion).
+        // Default to bilinear so any upscale is smooth; caller may override via reprojectOptions.
         const targetData = await reproject(['', lastDst, []], dstSrc, {
+          resampling: GRA_Bilinear,
           ...(options.reprojectOptions || {}),
           width: tileWidth,
           height: tileHeight,
@@ -230,12 +232,7 @@ export default async (
             }
           }
 
-          const outBandIdx =
-            info.GRIB_ELEMENT === 'UGRD'
-              ? 1
-              : info.GRIB_ELEMENT === 'VGRD'
-                ? 2
-                : b;
+          const outBandIdx = info.GRIB_ELEMENT === 'UGRD' ? 1 : info.GRIB_ELEMENT === 'VGRD' ? 2 : b;
           const bd = tileDst.bands.get(outBandIdx);
           const pixel = bd.pixels;
           const [min, max] = calcMinMax(dst.data);
@@ -281,7 +278,9 @@ export default async (
         }
 
         if (options.writeExif) {
-          const sortedBandKeys = Object.keys(minmaxByOutBand).map(Number).sort((a, b) => a - b);
+          const sortedBandKeys = Object.keys(minmaxByOutBand)
+            .map(Number)
+            .sort((a, b) => a - b);
           minmaxExif = sortedBandKeys.map((k) => minmaxByOutBand[k].join(',')).join(',');
           tileDst.setMetadata({
             EXIF_ImageDescription: minmaxExif,
