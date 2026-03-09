@@ -547,7 +547,7 @@ import path from "path";
 import { merge as merge4 } from "lodash";
 import Affine3 from "@sakitam-gis/affine";
 import { Constant, Mercantile } from "@sakitam-gis/mercantile";
-import { openAsync as openAsync5, GDT_Float32 as GDT_Float323, GDT_Byte, SpatialReference as SpatialReference4 } from "gdal-async";
+import { openAsync as openAsync5, GDT_Float32 as GDT_Float323, GDT_Byte, GRA_Average, GRA_Bilinear, SpatialReference as SpatialReference4 } from "gdal-async";
 import "ndarray-gdal";
 import ndarray2 from "ndarray";
 
@@ -649,8 +649,10 @@ var generateTiles_default = async (data, folder, opt = {}) => {
       lastDst = await openAsync5(data[0]);
     }
     const zooms = Array.isArray(options.zooms) ? Constant.range(options.zooms[0], options.zooms[1], options.zooms[2]) : Constant.range(options.zooms);
-    for (let i = 0; i < zooms.length; i++) {
-      const z = zooms[i];
+    const sortedDesc = [...zooms].sort((a, b) => b - a);
+    const cacheByZoom = /* @__PURE__ */ new Map();
+    for (let i = 0; i < sortedDesc.length; i++) {
+      const z = sortedDesc[i];
       const tileWidth = options.tileSize * 2 ** z;
       const tileHeight = options.tileSize * 2 ** z;
       const dstSrc = path.join(folder, options.cacheFolder, `${options.cacheFilePrefix}-${z}.tiff`);
@@ -658,10 +660,31 @@ var generateTiles_default = async (data, folder, opt = {}) => {
       if (!fc[0]) {
         await fs3.ensureFileSync(dstSrc);
       }
-      const targetData = fc[0] ? fc[1] : await reproject_default(["", lastDst, []], dstSrc, __spreadProps(__spreadValues({}, options.reprojectOptions || {}), {
-        width: tileWidth,
-        height: tileHeight
-      }));
+      if (fc[0]) {
+        cacheByZoom.set(z, fc[1]);
+      } else if (i === 0) {
+        const targetData = await reproject_default(["", lastDst, []], dstSrc, __spreadProps(__spreadValues({
+          resampling: GRA_Bilinear
+        }, options.reprojectOptions || {}), {
+          width: tileWidth,
+          height: tileHeight
+        }));
+        cacheByZoom.set(z, targetData);
+      } else {
+        const zAbove = sortedDesc[i - 1];
+        const above = cacheByZoom.get(zAbove);
+        const targetData = await reproject_default(["", above.data, []], dstSrc, __spreadProps(__spreadValues({}, options.reprojectOptions || {}), {
+          width: tileWidth,
+          height: tileHeight,
+          resampling: GRA_Average,
+          destinationProj4: options.tileProj4
+        }));
+        cacheByZoom.set(z, targetData);
+      }
+    }
+    for (let i = 0; i < zooms.length; i++) {
+      const z = zooms[i];
+      const targetData = cacheByZoom.get(z);
       const tiles = Mercantile.tiles(
         options.tileExtent[0],
         options.tileExtent[1],
@@ -708,6 +731,7 @@ var generateTiles_default = async (data, folder, opt = {}) => {
         tileDst.geoTransform = t.multiply(s).toGdal();
         tileDst.srs = SpatialReference4.fromProj4(options.tileProj4);
         let minmaxExif = "";
+        const minmaxByOutBand = {};
         for (let b = 1; b < count + 1; b++) {
           const e = bands.get(b);
           const info = e.getMetadata();
@@ -721,17 +745,15 @@ var generateTiles_default = async (data, folder, opt = {}) => {
               dst.set(j, k, v);
             }
           }
-          const bd = info.GRIB_ELEMENT === "VGRD" ? tileDst.bands.get(1) : info.GRIB_ELEMENT === "UGRD" ? tileDst.bands.get(2) : tileDst.bands.get(b);
+          const outBandIdx = info.GRIB_ELEMENT === "UGRD" ? 1 : info.GRIB_ELEMENT === "VGRD" ? 2 : b;
+          const bd = tileDst.bands.get(outBandIdx);
           const pixel = bd.pixels;
           const [min, max] = calcMinMax(dst.data);
           if (options.gray) {
             floatToGray(dst, min, max);
           }
           if (options.writeExif) {
-            if (minmaxExif !== "") {
-              minmaxExif += ",";
-            }
-            minmaxExif += `${min},${max}`;
+            minmaxByOutBand[outBandIdx] = [min, max];
             bd.setMetadata(__spreadProps(__spreadValues({}, info), {
               min,
               max
@@ -759,6 +781,8 @@ var generateTiles_default = async (data, folder, opt = {}) => {
           tilesPath.set(tileId, tilePath);
         }
         if (options.writeExif) {
+          const sortedBandKeys = Object.keys(minmaxByOutBand).map(Number).sort((a, b) => a - b);
+          minmaxExif = sortedBandKeys.map((k) => minmaxByOutBand[k].join(",")).join(",");
           tileDst.setMetadata({
             EXIF_ImageDescription: minmaxExif
           });
